@@ -1,0 +1,1 @@
+"""Offline batch image recolouring."""
