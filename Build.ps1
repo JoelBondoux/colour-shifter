@@ -1,12 +1,20 @@
+param([string]$PythonPath = '.venv\Scripts\python.exe')
+
 $ErrorActionPreference = 'Stop'
 Push-Location -LiteralPath $PSScriptRoot
 try {
-    $python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
-    if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+    if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
         throw 'Run Setup.cmd and install requirements-build.txt into .venv before building.'
     }
-    & $python -c "import platform; assert platform.system() == 'Windows' and platform.machine().upper() == 'AMD64', 'Build on x64 Windows with x64 Python.'"
-    if ($LASTEXITCODE -ne 0) { throw 'The build requires x64 Windows and x64 Python.' }
+    $python = (Resolve-Path -LiteralPath $PythonPath).Path
+    & $python -c "import platform, sys; sys.exit(not (platform.system() == 'Windows' and platform.machine().upper() == 'AMD64' and (3, 14, 10) <= sys.version_info < (3, 15)))"
+    if ($LASTEXITCODE -ne 0) { throw 'Build with x64 Python 3.14.10 or a later 3.14 patch release.' }
+    foreach ($path in @('build', 'dist', 'dist\Colour Shifter')) {
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Use a regular directory for $path."
+        }
+    }
     & $python -m colour_shifter.model
     if ($LASTEXITCODE -ne 0) { throw 'Model verification failed.' }
     & $python -m PyInstaller --noconfirm packaging/colour-shifter.spec

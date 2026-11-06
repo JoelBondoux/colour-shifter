@@ -17,7 +17,7 @@ Use x64 Windows 10 or 11. The app defaults to **GPU · DirectML** for AI inferen
 3. Optionally, click the original product where its current colour is visible. This limits changes to similar starting colours across the batch and is useful for products with contrasting trim. Use **Reset selection** to return to the whole foreground.
 4. Select **Preview selected photo** and compare the result with the original. Choose an export folder and select **Recolour batch**.
 
-Input formats are PNG, JPEG, WebP, BMP and single-frame TIFF. Folder selection adds supported files at the top level. Each batch creates a separate run folder with full-resolution PNGs, including any source transparency. If individual files fail, `errors.txt` lists them alongside the successful exports. **Stop batch** finishes the current photo and keeps the completed exports.
+Input formats are PNG, JPEG, WebP, BMP and single-frame TIFF, up to 100 MiB and 40 megapixels per image. Folder selection adds supported files at the top level. Each batch creates a separate run folder with full-resolution PNGs, including any source transparency. If individual files fail, `errors.txt` lists them alongside the successful exports. **Stop batch** finishes the current photo and keeps the completed exports.
 
 Colour Shifter works best when a clearly visible product fills a useful part of the frame. The model selects salient foreground objects, so a person, props or similar colours may also be selected. Preview representative photos, especially when the batch includes different scenes or products. The reference swatch anchors the material's midtone, and each photo's lighting influences the final shade.
 
@@ -29,13 +29,16 @@ The desktop app and MCP share the library in `%LOCALAPPDATA%\Colour Shifter\swat
 
 ## Local MCP API
 
-Configure a local MCP client to launch **Colour Shifter MCP.exe** from the same extracted folder using the stdio transport. The client starts the server when needed. For a client that accepts an `mcpServers` configuration, use the full path to the extracted executable.
+Configure a local MCP client to launch **Colour Shifter MCP.exe** from the same extracted folder using the stdio transport. Create a dedicated local image and export folder and pass its path as `COLOUR_SHIFTER_MCP_ROOT`. Only files and folders under that root are eligible for image tools. Use regular paths on a fixed local drive and copy files into the folder. MCP batches accept up to 250 images.
 
 ```json
 {
   "mcpServers": {
     "colour-shifter": {
-      "command": "C:\\Apps\\Colour Shifter\\Colour Shifter MCP.exe"
+      "command": "C:\\Apps\\Colour Shifter\\Colour Shifter MCP.exe",
+      "env": {
+        "COLOUR_SHIFTER_MCP_ROOT": "C:\\Colour Shifter Workspace"
+      }
     }
   }
 }
@@ -52,7 +55,7 @@ Use absolute paths to images and folders on the machine running the server. For 
 
 ## Run or build from source
 
-Install x64 [Python 3.11](https://www.python.org/downloads/windows/) with the Python launcher and Tkinter. Run **Setup.cmd** to install dependencies and download the verified AI model. Open **Start.cmd** for the desktop app, or launch the local MCP server with `\.venv\Scripts\python.exe -m colour_shifter.mcp_server`.
+Install x64 [Python 3.14](https://www.python.org/downloads/windows/) with the Python launcher and Tkinter. Use Python 3.14.10 or a later 3.14 patch release. Run **Setup.cmd** to install dependencies and download the verified AI model. Open **Start.cmd** for the desktop app, or launch the local MCP server with `\.venv\Scripts\python.exe -m colour_shifter.mcp_server` and the workspace environment variable above.
 
 To build the portable Windows package from that environment:
 

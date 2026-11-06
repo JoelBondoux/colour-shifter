@@ -11,7 +11,7 @@ import onnxruntime as ort
 from PIL import Image, ImageChops
 
 from .images import open_image
-from .model import MODEL_PATH
+from .model import MODEL_PATH, read_verified_model
 from .swatches import RGB
 
 
@@ -35,7 +35,8 @@ class Segmenter:
         options = ort.SessionOptions()
         options.enable_mem_pattern = False
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        self.session = ort.InferenceSession(str(MODEL_PATH), sess_options=options, providers=[provider])
+        # Parse the bytes that were verified and keep ONNX external data paths disabled.
+        self.session = ort.InferenceSession(read_verified_model(), sess_options=options, providers=[provider])
         if self.session.get_providers()[0] != provider:
             raise RuntimeError("Could not start DirectML. Check the graphics driver or select CPU.")
         self.session.disable_fallback()
@@ -156,17 +157,23 @@ def export_batch(
         # A fresh run folder and numbered files also separate duplicate stems.
         output = run_folder / f"{index:04d}-{path.stem[:80]}.png"
         temporary = output.with_suffix(".part")
+        owns_temporary = False
         try:
             result = recolour(segmenter, open_image(path), target, source)
-            result.save(temporary, format="PNG")
-            temporary.replace(output)
+            with temporary.open("xb") as stream:
+                owns_temporary = True
+                result.save(stream, format="PNG")
+            temporary.rename(output)
+            owns_temporary = False
             successes += 1
         except (OSError, ValueError, Image.DecompressionBombError) as error:
             failures.append(f"{path.name} — {error}")
         finally:
-            temporary.unlink(missing_ok=True)
+            if owns_temporary:
+                temporary.unlink(missing_ok=True)
         progress(index, f"Processed {index} of {len(paths)}")
 
     if failures:
-        (run_folder / "errors.txt").write_text("\n".join(failures) + "\n", encoding="utf-8")
+        with (run_folder / "errors.txt").open("x", encoding="utf-8") as report:
+            report.write("\n".join(failures) + "\n")
     return run_folder, successes, failures

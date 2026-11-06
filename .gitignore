@@ -1,4 +1,5 @@
 /.venv/
+/.venv-secure/
 /build/
 /dist/
 /models/

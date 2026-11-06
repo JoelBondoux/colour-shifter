@@ -5,16 +5,15 @@ import sys
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
-from threading import Lock
 from typing import Annotated, Literal
 
-from anyio import from_thread, to_thread
+from anyio import Lock, from_thread, get_cancelled_exc_class, to_thread
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from .images import folder_images, open_image
+from .images import open_image
+from .mcp_paths import MAX_BATCH_IMAGES, McpWorkspace
 from .recolour import Segmenter, export_batch, reference_colour, sample_colour
 from .swatches import Swatch, SwatchStore, hex_colour, parse_hex, remember_batch_colour
 
@@ -25,7 +24,8 @@ mcp = FastMCP(
     "Colour Shifter",
     instructions=(
         "Recolour local product photos using an existing swatch, hex colour or reference photo. "
-        "Use absolute Windows paths. Exports go into a new folder and the originals are preserved."
+        "Use absolute paths inside the configured Colour Shifter MCP workspace. "
+        "Exports go into a new folder and the originals are preserved."
     ),
 )
 inference_lock = Lock()
@@ -51,20 +51,6 @@ class Batch:
     failed: int
     error_report: str | None
     warning: str | None
-
-
-def absolute_path(value: str) -> Path:
-    path = Path(value)
-    if not path.is_absolute():
-        raise ValueError(f"Use an absolute path for {value!r}.")
-    return path
-
-
-def directory(value: str) -> Path:
-    path = absolute_path(value)
-    if not path.is_dir():
-        raise ValueError(f"Choose an existing folder. Could not open {value!r}.")
-    return path
 
 
 @lru_cache(maxsize=1)
@@ -110,23 +96,25 @@ async def sample_reference(
 ) -> Sample:
     """Read a hex colour from a reference photo. Omit coordinates to sample the AI-selected foreground."""
     def sample():
-        image = open_image(absolute_path(image_path))
+        image = open_image(McpWorkspace().image(image_path))
         if x is None and y is None:
-            with inference_lock:
-                mask = segmenter(backend).foreground(image)
+            mask = segmenter(backend).foreground(image)
             return Sample(hex_colour(reference_colour(image, mask)))
         if x is None or y is None or x >= image.width or y >= image.height:
             raise ValueError("Supply both pixel coordinates inside the image, or omit both.")
         return Sample(hex_colour(sample_colour(image, x, y)))
 
-    return await to_thread.run_sync(sample)
+    async with inference_lock:
+        return await to_thread.run_sync(sample)
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False, openWorldHint=False))
 async def recolour_batch(
     output_folder: Annotated[str, Field(description="Absolute path to an existing folder for the new export folder.")],
     ctx: Context,
-    image_paths: Annotated[list[str] | None, Field(description="Absolute paths of the input images.")] = None,
+    image_paths: Annotated[list[str] | None, Field(
+        max_length=MAX_BATCH_IMAGES, description="Absolute paths of images inside the configured workspace."
+    )] = None,
     input_folder: Annotated[str | None, Field(description="Top-level images in this folder. Alternative to image_paths.")] = None,
     swatch_name: Annotated[str | None, Field(description="Saved swatch to use as the target.")] = None,
     target_hex: Annotated[str | None, Field(description="Target as a six-digit hex colour.")] = None,
@@ -135,45 +123,57 @@ async def recolour_batch(
     backend: Backend = "gpu",
 ) -> Batch:
     """Recolour photos and export full-resolution PNGs. Supply one input option and exactly one target option."""
+    cancelled_error = get_cancelled_exc_class()
+
     def run():
+        workspace = McpWorkspace()
         if (image_paths is None) == (input_folder is None):
             raise ValueError("Provide either image_paths or input_folder.")
         paths = (
-            folder_images(directory(input_folder)) if input_folder is not None
-            else list(dict.fromkeys(absolute_path(path) for path in image_paths))
+            workspace.images_in(input_folder) if input_folder is not None
+            else list(dict.fromkeys(workspace.image(path, allow_missing=True) for path in image_paths))
         )
         if not paths:
             raise ValueError("Provide at least one supported input image.")
         if sum(value is not None for value in (swatch_name, target_hex, reference_image)) != 1:
             raise ValueError("Provide exactly one of swatch_name, target_hex or reference_image.")
-        destination = directory(output_folder)
+        destination = workspace.directory(output_folder)
         source = parse_hex(original_hex) if original_hex is not None else None
         if swatch_name is not None:
             target = parse_hex(SwatchStore().get(swatch_name).hex)
         elif target_hex is not None:
             target = parse_hex(target_hex)
         else:
-            reference = open_image(absolute_path(reference_image))
-            with inference_lock:
-                target = reference_colour(reference, segmenter(backend).foreground(reference))
+            reference = open_image(workspace.image(reference_image))
+            target = reference_colour(reference, segmenter(backend).foreground(reference))
 
         reported = -1
 
+        def cancelled():
+            try:
+                from_thread.check_cancelled()
+            except cancelled_error:
+                return True
+            return False
+
         def progress(count, message):
             nonlocal reported
-            if count > reported:
-                from_thread.run(ctx.report_progress, count, len(paths), message)
+            if count > reported and not cancelled():
+                try:
+                    from_thread.run(ctx.report_progress, count, len(paths), message)
+                except cancelled_error:
+                    return
                 reported = count
 
-        with inference_lock:
-            folder, count, errors = export_batch(segmenter(backend), paths, destination, target, source, progress, lambda: False)
+        folder, count, errors = export_batch(segmenter(backend), paths, destination, target, source, progress, cancelled)
         return Batch(
             str(folder), hex_colour(target), backend, count, len(errors),
             str(folder / "errors.txt") if errors else None,
             remember_batch_colour(target) if count else None,
         )
 
-    return await to_thread.run_sync(run)
+    async with inference_lock:
+        return await to_thread.run_sync(run)
 
 
 def main():

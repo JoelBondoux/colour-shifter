@@ -1,5 +1,7 @@
 """Image I/O shared by preview and export."""
 
+import os
+import stat
 from io import BytesIO
 from pathlib import Path
 
@@ -7,17 +9,25 @@ from PIL import Image, ImageCms, ImageOps
 
 
 IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"})
+IMAGE_FORMATS = ("PNG", "JPEG", "WEBP", "BMP", "TIFF")
+MAX_IMAGE_BYTES = 100 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
+MAX_PROFILE_BYTES = 4 * 1024 * 1024
 
 
 def open_image(path: Path) -> Image.Image:
-    with Image.open(path) as opened:
-        if getattr(opened, "n_frames", 1) != 1:
+    with path.open("rb") as stream, Image.open(_checked_stream(stream), formats=IMAGE_FORMATS) as opened:
+        if opened.width * opened.height > MAX_IMAGE_PIXELS:
+            raise ValueError("Choose an image with no more than 40 million pixels.")
+        if getattr(opened, "is_animated", False):
             raise ValueError("Choose a single-frame image.")
 
         image = ImageOps.exif_transpose(opened)
         rgba = image.convert("RGBA")
         profile = image.info.get("icc_profile")
         if profile:
+            if len(profile) > MAX_PROFILE_BYTES:
+                raise ValueError("The embedded colour profile exceeds 4 MiB.")
             # Preserve the appearance of tagged images when exporting in sRGB.
             try:
                 source = ImageCms.getOpenProfile(BytesIO(profile))
@@ -33,6 +43,13 @@ def open_image(path: Path) -> Image.Image:
         # Do not carry across stale ICC, orientation or other source metadata.
         rgba.info.clear()
         return rgba
+
+
+def _checked_stream(stream):
+    info = os.fstat(stream.fileno())
+    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_IMAGE_BYTES:
+        raise ValueError("Choose an image file no larger than 100 MiB.")
+    return stream
 
 
 def folder_images(folder: Path) -> list[Path]:
