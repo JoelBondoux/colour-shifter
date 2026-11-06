@@ -1,6 +1,7 @@
 """Colour Shifter desktop application."""
 
 import os
+import sqlite3
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -12,6 +13,8 @@ from PIL import Image, ImageTk
 
 from .images import IMAGE_EXTENSIONS, folder_images, open_image
 from .recolour import Segmenter, export_batch, recolour, reference_colour, sample_colour
+from .swatch_dialog import SwatchDialog
+from .swatches import hex_colour, remember_batch_colour
 
 
 BACKGROUND = "#141822"
@@ -23,10 +26,6 @@ ACCENT = "#b8f4d5"
 FONT = "Segoe UI"
 GPU = "GPU · DirectML"
 FILE_TYPES = [("Images", " ".join(f"*{ext}" for ext in sorted(IMAGE_EXTENSIONS))), ("All files", "*.*")]
-
-
-def hex_colour(colour: tuple[int, int, int]) -> str:
-    return "#{:02X}{:02X}{:02X}".format(*colour)
 
 
 class Photo(ttk.Frame):
@@ -105,8 +104,8 @@ class App(tk.Tk):
         self.engine = None
         self.engine_cpu = None
         self.backend = tk.StringVar(value=GPU)
-        self.status = tk.StringVar(value="Choose a reference image and add product photos to begin.")
-        self.target_text = tk.StringVar(value="Choose a reference")
+        self.status = tk.StringVar(value="Choose a reference or swatch and add product photos to begin.")
+        self.target_text = tk.StringVar(value="No colour selected")
         self.source_text = tk.StringVar(value="Whole foreground product")
         self.output_text = tk.StringVar(value="Choose where to save the batch.")
         self.batch_text = tk.StringVar(value="2   Product photos")
@@ -132,6 +131,9 @@ class App(tk.Tk):
         style.configure("TCombobox", fieldbackground=PANEL, background=PANEL, arrowcolor=MUTED)
         style.map("TCombobox", fieldbackground=[("readonly", PANEL)], foreground=[("readonly", TEXT)])
         style.configure("Horizontal.TProgressbar", background=ACCENT, troughcolor=PANEL, bordercolor=PANEL)
+        style.configure("Treeview", background=WELL, fieldbackground=WELL, foreground=TEXT)
+        style.configure("Treeview.Heading", background=PANEL, foreground=TEXT)
+        style.map("Treeview", background=[("selected", "#3c516b")], foreground=[("selected", TEXT)])
 
     def build(self):
         outer = ttk.Frame(self, padding=(20, 16))
@@ -162,6 +164,8 @@ class App(tk.Tk):
         self.target_swatch = tk.Label(target_bar, width=3, background=WELL)
         self.target_swatch.pack(side="left", padx=(0, 8))
         ttk.Label(target_bar, textvariable=self.target_text).pack(side="left")
+        self.swatches_button = ttk.Button(target_bar, text="Swatch library…", command=self.open_swatches)
+        self.swatches_button.pack(side="right")
 
         ttk.Label(controls, textvariable=self.batch_text, font=(FONT, 11, "bold")).pack(anchor="w")
         file_bar = ttk.Frame(controls)
@@ -232,7 +236,7 @@ class App(tk.Tk):
         enabled = not self.busy
         has_input = self.original.image is not None and self.target is not None
         for button, condition in (
-            (self.reference_button, True), (self.files_button, True), (self.folder_button, True),
+            (self.reference_button, True), (self.swatches_button, True), (self.files_button, True), (self.folder_button, True),
             (self.clear_button, bool(self.paths)), (self.output_button, True), (self.preview_button, has_input),
             (self.clear_source_button, self.source is not None), (self.open_button, self.last_export is not None),
             (self.run_button, bool(self.paths) and self.target is not None and self.output is not None),
@@ -318,6 +322,17 @@ class App(tk.Tk):
             self.reference.show(self.reference.image, (x, y))
         except ValueError as error:
             self.status.set(str(error))
+
+    def open_swatches(self):
+        try:
+            SwatchDialog(self, self.target, self.use_swatch)
+        except (OSError, sqlite3.Error) as error:
+            messagebox.showerror("Could not open swatch library", str(error), parent=self)
+
+    def use_swatch(self, colour, name):
+        self.reference.show(self.reference.image)
+        self.set_target(colour)
+        self.status.set(f"Using swatch {name}. Preview a photo or recolour the batch.")
 
     def choose_files(self):
         files = filedialog.askopenfilenames(parent=self, title="Add product photos", filetypes=FILE_TYPES)
@@ -410,20 +425,25 @@ class App(tk.Tk):
         self.progress.configure(maximum=len(paths), value=0)
 
         def finished(result):
-            self.last_export, count, failures = result
+            (self.last_export, count, failures), warning = result
             summary = f"Exported {count} of {len(paths)} photos."
             if self.cancel_batch.is_set() and count + len(failures) < len(paths):
                 summary += " Batch stopped."
             if failures:
                 summary += f" {len(failures)} failed. See errors.txt in the export folder."
+            if warning:
+                summary += f" {warning}"
             self.status.set(summary)
 
-        self.launch(
-            lambda engine: export_batch(
+        def job(engine):
+            result = export_batch(
                 engine, paths, output, target, source,
                 lambda count, status: self.events.put((count, status)), self.cancel_batch.is_set,
-            ),
-            finished, "Preparing the batch…", batch=True,
+            )
+            return result, remember_batch_colour(target) if result[1] else None
+
+        self.launch(
+            job, finished, "Preparing the batch…", batch=True,
         )
 
     def stop(self):

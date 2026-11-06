@@ -3,6 +3,7 @@
 from collections.abc import Callable, Sequence
 from datetime import datetime
 from pathlib import Path
+import sys
 from tempfile import mkdtemp
 
 import numpy as np
@@ -11,9 +12,9 @@ from PIL import Image, ImageChops
 
 from .images import open_image
 from .model import MODEL_PATH
+from .swatches import RGB
 
 
-RGB = tuple[int, int, int]
 MODEL_SIZE = (512, 512)
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -23,11 +24,13 @@ MASK_CURVE = np.rint(255 * np.clip((np.arange(256) - 26) / 203, 0, 1)).tolist()
 class Segmenter:
     def __init__(self, *, cpu: bool = False) -> None:
         if not MODEL_PATH.is_file():
+            if getattr(sys, "frozen", False):
+                raise FileNotFoundError("The bundled AI model is missing. Extract the complete release ZIP again.")
             raise FileNotFoundError("The AI model is missing. Run Setup.cmd first.")
 
         provider = "CPUExecutionProvider" if cpu else "DmlExecutionProvider"
         if provider not in ort.get_available_providers():
-            raise RuntimeError("DirectML is unavailable. Run Setup.cmd to install the GPU runtime.")
+            raise RuntimeError("DirectML is unavailable. Select CPU or check the graphics driver and installation.")
 
         options = ort.SessionOptions()
         options.enable_mem_pattern = False
