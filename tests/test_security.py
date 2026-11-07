@@ -97,6 +97,17 @@ class McpWorkspaceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "COLOUR_SHIFTER_MCP_ROOT"):
                 McpWorkspace()
 
+    def test_recursive_catalogue_checks_nested_inputs(self):
+        nested = self.root / "nested"
+        nested.mkdir()
+        regular = nested / "product.png"
+        regular.touch()
+        self.assertEqual(self.workspace.catalogue_images(str(self.root)), [regular])
+        alias = nested / "alias.png"
+        os.link(self.outside, alias)
+        with self.assertRaisesRegex(ValueError, "hard-linked"):
+            self.workspace.catalogue_images(str(self.root))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,10 +15,11 @@ MAX_IMAGE_PIXELS = 40_000_000
 MAX_PROFILE_BYTES = 4 * 1024 * 1024
 
 
-def open_image(path: Path) -> Image.Image:
+def open_image(path: Path, *, max_pixels: int | None = None) -> Image.Image:
+    limit = MAX_IMAGE_PIXELS if max_pixels is None else max_pixels
     with path.open("rb") as stream, Image.open(_checked_stream(stream), formats=IMAGE_FORMATS) as opened:
-        if opened.width * opened.height > MAX_IMAGE_PIXELS:
-            raise ValueError("Choose an image with no more than 40 million pixels.")
+        if opened.width * opened.height > limit:
+            raise ValueError(f"Choose an image with no more than {limit:,} pixels.")
         if getattr(opened, "is_animated", False):
             raise ValueError("Choose a single-frame image.")
 

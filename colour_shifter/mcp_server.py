@@ -12,8 +12,9 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from .catalogue import export_catalogue
 from .images import open_image
-from .mcp_paths import MAX_BATCH_IMAGES, McpWorkspace
+from .mcp_paths import MAX_BATCH_IMAGES, MAX_CATALOGUE_IMAGES, McpWorkspace
 from .recolour import Segmenter, export_batch, reference_colour, sample_colour
 from .swatches import Swatch, SwatchStore, hex_colour, parse_hex, remember_batch_colour
 
@@ -51,6 +52,40 @@ class Batch:
     failed: int
     error_report: str | None
     warning: str | None
+
+
+@dataclass
+class Catalogue:
+    output_folder: str
+    manifest: str
+    palette: list[Swatch]
+    photos: int
+    completed: int
+    variants: int
+    failed: int
+
+
+def batch_callbacks(ctx: Context):
+    cancelled_error = get_cancelled_exc_class()
+    reported = -1
+
+    def cancelled():
+        try:
+            from_thread.check_cancelled()
+        except cancelled_error:
+            return True
+        return False
+
+    def progress(count, total, message):
+        nonlocal reported
+        if count > reported and not cancelled():
+            try:
+                from_thread.run(ctx.report_progress, count, total, message)
+            except cancelled_error:
+                return
+            reported = count
+
+    return progress, cancelled
 
 
 @lru_cache(maxsize=1)
@@ -94,7 +129,7 @@ async def sample_reference(
     y: Annotated[int | None, Field(ge=0, description="Optional pixel row, paired with x.")] = None,
     backend: Backend = "gpu",
 ) -> Sample:
-    """Read a hex colour from a reference photo. Omit coordinates to sample the AI-selected foreground."""
+    """Read a hex colour from a reference photo. Omit coordinates to discover the main material colour."""
     def sample():
         image = open_image(McpWorkspace().image(image_path))
         if x is None and y is None:
@@ -119,11 +154,11 @@ async def recolour_batch(
     swatch_name: Annotated[str | None, Field(description="Saved swatch to use as the target.")] = None,
     target_hex: Annotated[str | None, Field(description="Target as a six-digit hex colour.")] = None,
     reference_image: Annotated[str | None, Field(description="Absolute reference image path for automatic colour sampling.")] = None,
-    original_hex: Annotated[str | None, Field(description="Optional starting colour to restrict edits within the foreground.")] = None,
+    original_hex: Annotated[str | None, Field(description="Optional starting colour override. Otherwise each photo is analysed automatically.")] = None,
     backend: Backend = "gpu",
 ) -> Batch:
     """Recolour photos and export full-resolution PNGs. Supply one input option and exactly one target option."""
-    cancelled_error = get_cancelled_exc_class()
+    report, cancelled = batch_callbacks(ctx)
 
     def run():
         workspace = McpWorkspace()
@@ -147,29 +182,56 @@ async def recolour_batch(
             reference = open_image(workspace.image(reference_image))
             target = reference_colour(reference, segmenter(backend).foreground(reference))
 
-        reported = -1
-
-        def cancelled():
-            try:
-                from_thread.check_cancelled()
-            except cancelled_error:
-                return True
-            return False
-
         def progress(count, message):
-            nonlocal reported
-            if count > reported and not cancelled():
-                try:
-                    from_thread.run(ctx.report_progress, count, len(paths), message)
-                except cancelled_error:
-                    return
-                reported = count
+            report(count, len(paths), message)
 
         folder, count, errors = export_batch(segmenter(backend), paths, destination, target, source, progress, cancelled)
         return Batch(
             str(folder), hex_colour(target), backend, count, len(errors),
             str(folder / "errors.txt") if errors else None,
             remember_batch_colour(target) if count else None,
+        )
+
+    async with inference_lock:
+        return await to_thread.run_sync(run)
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, openWorldHint=False))
+async def export_colourways(
+    input_folder: Annotated[str, Field(description="Absolute path to the catalogue root. Includes subfolders.")],
+    reference_folder: Annotated[str, Field(description="Absolute path to the folder containing the five reference colours.")],
+    output_folder: Annotated[str, Field(description="Existing output folder outside the input tree.")],
+    ctx: Context,
+    suffix: bool = True,
+    backend: Backend = "gpu",
+    only_photos: Annotated[list[str] | None, Field(
+        max_length=MAX_CATALOGUE_IMAGES, description="Optional absolute paths of specific photos to export or retry."
+    )] = None,
+    starting_colours: Annotated[dict[str, str] | None, Field(
+        max_length=MAX_CATALOGUE_IMAGES, description="Optional map from absolute photo paths to starting hex colours."
+    )] = None,
+) -> Catalogue:
+    """Discover five colours, then export each photo once per colour with a mirrored folder tree."""
+    progress, cancelled = batch_callbacks(ctx)
+
+    def run():
+        workspace = McpWorkspace()
+        root = workspace.directory(input_folder)
+        references = workspace.directory(reference_folder)
+        destination = workspace.directory(output_folder)
+        selected = {workspace.image(path) for path in only_photos} if only_photos is not None else None
+        overrides = {workspace.image(path): parse_hex(colour) for path, colour in (starting_colours or {}).items()}
+        result = export_catalogue(
+            segmenter(backend), root, references, destination, suffix=suffix,
+            progress=progress, cancelled=cancelled,
+            photos=workspace.catalogue_images(input_folder),
+            reference_paths=workspace.images_in(reference_folder),
+            only_photos=selected, overrides=overrides,
+        )
+        return Catalogue(
+            str(result.folder), str(result.folder / "manifest.json"),
+            [Swatch(swatch.name, hex_colour(swatch.rgb)) for swatch in result.palette],
+            result.photos, result.completed, result.variants, result.failed,
         )
 
     async with inference_lock:

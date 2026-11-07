@@ -11,8 +11,9 @@ from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageTk
 
+from .catalogue import export_catalogue
 from .images import IMAGE_EXTENSIONS, folder_images, open_image
-from .recolour import Segmenter, export_batch, recolour, reference_colour, sample_colour
+from .recolour import Segmenter, apply_colour, export_batch, prepare_recolour, reference_colour, sample_colour
 from .swatch_dialog import SwatchDialog
 from .swatches import hex_colour, remember_batch_colour
 
@@ -31,7 +32,8 @@ FILE_TYPES = [("Images", " ".join(f"*{ext}" for ext in sorted(IMAGE_EXTENSIONS))
 class Photo(ttk.Frame):
     def __init__(self, parent, title, placeholder, clicked=None, height=140):
         super().__init__(parent, padding=8, style="Panel.TFrame")
-        ttk.Label(self, text=title, style="Panel.TLabel", font=(FONT, 10, "bold")).pack(anchor="w", pady=(0, 6))
+        self.caption = ttk.Label(self, text=title, style="Panel.TLabel", font=(FONT, 10, "bold"))
+        self.caption.pack(anchor="w", pady=(0, 6))
         self.canvas = tk.Canvas(self, background=WELL, borderwidth=0, highlightthickness=0, width=1, height=height)
         self.canvas.pack(fill="both", expand=True)
         self.placeholder = placeholder
@@ -94,7 +96,9 @@ class App(tk.Tk):
         self.configure(background=BACKGROUND)
         self.paths = []
         self.target = None
-        self.source = None
+        self.source_overrides = {}
+        self.preview_result = None
+        self.preview_mask = None
         self.output = None
         self.last_export = None
         self.busy = False
@@ -106,7 +110,9 @@ class App(tk.Tk):
         self.backend = tk.StringVar(value=GPU)
         self.status = tk.StringVar(value="Choose a reference or swatch and add product photos to begin.")
         self.target_text = tk.StringVar(value="No colour selected")
-        self.source_text = tk.StringVar(value="Whole foreground product")
+        self.source_text = tk.StringVar(value="Starting colour · automatic")
+        self.show_mask = tk.BooleanVar(value=False)
+        self.catalogue_suffix = tk.BooleanVar(value=True)
         self.output_text = tk.StringVar(value="Choose where to save the batch.")
         self.batch_text = tk.StringVar(value="2   Product photos")
         self.configure_styles()
@@ -195,6 +201,10 @@ class App(tk.Tk):
         self.output_button = ttk.Button(output_bar, text="Choose folder…", command=self.choose_output)
         self.output_button.pack(side="right")
         ttk.Label(controls, textvariable=self.output_text, style="Muted.TLabel", wraplength=290).pack(anchor="w")
+        self.catalogue_button = ttk.Button(controls, text="Export 5-colour catalogue…", command=self.choose_catalogue)
+        self.catalogue_button.pack(fill="x", pady=(12, 4))
+        self.suffix_check = ttk.Checkbutton(controls, text="Append colour name to filenames", variable=self.catalogue_suffix)
+        self.suffix_check.pack(anchor="w")
 
         preview = ttk.Frame(outer)
         preview.grid(row=1, column=1, sticky="nsew")
@@ -212,10 +222,12 @@ class App(tk.Tk):
         source_bar = ttk.Frame(preview)
         source_bar.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Label(source_bar, textvariable=self.source_text, style="Muted.TLabel").pack(side="left")
-        self.clear_source_button = ttk.Button(source_bar, text="Reset selection", command=self.clear_source)
+        self.clear_source_button = ttk.Button(source_bar, text="Use automatic colour", command=self.clear_source)
         self.clear_source_button.pack(side="right")
+        self.mask_check = ttk.Checkbutton(source_bar, text="Show mask", variable=self.show_mask, command=self.display_preview)
+        self.mask_check.pack(side="right", padx=(0, 10))
         ttk.Label(
-            preview, text="Optional · click the original to limit recolouring to a similar starting colour.",
+            preview, text="Click the original to override the starting colour for this photo.",
             style="Muted.TLabel", wraplength=500,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(1, 0))
 
@@ -238,7 +250,9 @@ class App(tk.Tk):
         for button, condition in (
             (self.reference_button, True), (self.swatches_button, True), (self.files_button, True), (self.folder_button, True),
             (self.clear_button, bool(self.paths)), (self.output_button, True), (self.preview_button, has_input),
-            (self.clear_source_button, self.source is not None), (self.open_button, self.last_export is not None),
+            (self.clear_source_button, self.selected_path() in self.source_overrides),
+            (self.mask_check, self.preview_mask is not None), (self.catalogue_button, True), (self.suffix_check, True),
+            (self.open_button, self.last_export is not None),
             (self.run_button, bool(self.paths) and self.target is not None and self.output is not None),
         ):
             button.configure(state="normal" if enabled and condition else "disabled")
@@ -265,10 +279,10 @@ class App(tk.Tk):
         def poll():
             while True:
                 try:
-                    count, status_text = self.events.get_nowait()
+                    count, total, status_text = self.events.get_nowait()
                 except Empty:
                     break
-                self.progress["value"] = count
+                self.progress.configure(value=count, maximum=total)
                 self.status.set(status_text)
             if not future.done():
                 self.after(80, poll)
@@ -309,7 +323,7 @@ class App(tk.Tk):
         self.target = colour
         self.target_text.set(hex_colour(colour) if colour is not None else "Click to sample")
         self.target_swatch.configure(background=hex_colour(colour) if colour is not None else WELL)
-        self.result.show(None)
+        self.invalidate_preview()
         if colour is not None:
             self.status.set("Reference colour ready. Select a photo to preview or recolour the batch.")
         self.refresh()
@@ -366,18 +380,27 @@ class App(tk.Tk):
 
     def clear_files(self):
         self.paths.clear()
+        self.source_overrides.clear()
         self.file_list.delete(0, "end")
         self.batch_text.set("2   Product photos")
         self.original.show(None)
-        self.clear_source()
+        self.source_text.set("Starting colour · automatic")
+        self.invalidate_preview()
+        self.refresh()
+
+    def selected_path(self):
+        indices = self.file_list.curselection()
+        return self.paths[indices[0]] if indices else None
 
     def select_input(self, event=None):
-        if self.busy or not self.file_list.curselection():
+        path = self.selected_path()
+        if self.busy or path is None:
             return
-        self.result.show(None)
-        path = self.paths[self.file_list.curselection()[0]]
+        self.invalidate_preview()
+        sample = self.source_overrides.get(path)
+        self.source_text.set(f"Starting colour · override {hex_colour(sample[0])}" if sample else "Starting colour · automatic")
         try:
-            self.original.show(open_image(path))
+            self.original.show(open_image(path), sample[1] if sample else None)
         except (OSError, ValueError, Image.DecompressionBombError) as error:
             self.original.show(None)
             self.status.set(f"{path.name} · {error}")
@@ -387,20 +410,21 @@ class App(tk.Tk):
         if self.busy:
             return
         try:
-            self.source = sample_colour(self.original.image, x, y)
+            source = sample_colour(self.original.image, x, y)
         except ValueError as error:
             self.status.set(str(error))
             return
-        self.source_text.set(f"Match starting colour {hex_colour(self.source)}")
+        self.source_overrides[self.selected_path()] = (source, (x, y))
+        self.source_text.set(f"Starting colour · override {hex_colour(source)}")
         self.original.show(self.original.image, (x, y))
-        self.result.show(None)
+        self.invalidate_preview()
         self.refresh()
 
     def clear_source(self):
-        self.source = None
-        self.source_text.set("Whole foreground product")
+        self.source_overrides.pop(self.selected_path(), None)
+        self.source_text.set("Starting colour · automatic")
         self.original.show(self.original.image)
-        self.result.show(None)
+        self.invalidate_preview()
         self.refresh()
 
     def choose_output(self):
@@ -411,16 +435,34 @@ class App(tk.Tk):
             self.refresh()
 
     def make_preview(self):
-        image, target, source = self.original.image, self.target, self.source
+        image, target = self.original.image, self.target
+        sample = self.source_overrides.get(self.selected_path())
+
+        def job(engine):
+            source, mask, reflections = prepare_recolour(engine, image, sample[0] if sample else None)
+            return source, mask, apply_colour(image, mask, target, reflections=reflections)
 
         def finished(result):
-            self.result.show(result)
-            self.status.set("Preview ready. The batch will use these colour settings.")
+            source, self.preview_mask, self.preview_result = result
+            mode = "override" if sample else "detected"
+            self.source_text.set(f"Starting colour · {mode} {hex_colour(source)}")
+            self.display_preview()
+            self.status.set("Preview ready. Use Show mask to inspect the selected material.")
 
-        self.launch(lambda engine: recolour(engine, image, target, source), finished, "Recolouring the preview…")
+        self.launch(job, finished, "Detecting starting colour and masking the product…")
+
+    def invalidate_preview(self):
+        self.preview_result = self.preview_mask = None
+        self.display_preview()
+
+    def display_preview(self):
+        show_mask = self.show_mask.get() and self.preview_mask is not None
+        self.result.caption.configure(text="Mask · selected product surface" if show_mask else "Recoloured")
+        self.result.show(self.preview_mask if show_mask else self.preview_result)
 
     def run_batch(self):
-        paths, output, target, source = tuple(self.paths), self.output, self.target, self.source
+        paths, output, target = tuple(self.paths), self.output, self.target
+        overrides = {path: sample[0] for path, sample in self.source_overrides.items()}
         self.cancel_batch.clear()
         self.progress.configure(maximum=len(paths), value=0)
 
@@ -437,14 +479,50 @@ class App(tk.Tk):
 
         def job(engine):
             result = export_batch(
-                engine, paths, output, target, source,
-                lambda count, status: self.events.put((count, status)), self.cancel_batch.is_set,
+                engine, paths, output, target, None,
+                lambda count, status: self.events.put((count, len(paths), status)), self.cancel_batch.is_set,
+                overrides=overrides,
             )
             return result, remember_batch_colour(target) if result[1] else None
 
         self.launch(
             job, finished, "Preparing the batch…", batch=True,
         )
+
+    def choose_catalogue(self):
+        source = filedialog.askdirectory(parent=self, title="Choose the catalogue folder and its subfolders", mustexist=True)
+        if not source:
+            return
+        references = filedialog.askdirectory(parent=self, title="Choose the folder containing the five colour reference shots",
+                                              initialdir=source, mustexist=True)
+        if not references:
+            return
+        destination = filedialog.askdirectory(parent=self, title="Choose a separate destination for the colourways",
+                                              initialdir=self.output, mustexist=True)
+        if destination:
+            self.run_catalogue(Path(source), Path(references), Path(destination))
+
+    def run_catalogue(self, root, references, destination):
+        suffix = self.catalogue_suffix.get()
+        overrides = {path.resolve(): sample[0] for path, sample in self.source_overrides.items()}
+        self.cancel_batch.clear()
+        self.progress.configure(maximum=1, value=0)
+
+        def job(engine):
+            return export_catalogue(
+                engine, root, references, destination, suffix=suffix, overrides=overrides,
+                progress=lambda count, total, status: self.events.put((count, total, status)),
+                cancelled=self.cancel_batch.is_set,
+            )
+
+        def finished(result):
+            self.last_export = result.folder
+            summary = f"Exported {result.variants} versions. {result.completed} of {result.photos} photos have all five."
+            if result.failed or self.cancel_batch.is_set():
+                summary += " See manifest.json for incomplete photos."
+            self.status.set(summary)
+
+        self.launch(job, finished, "Discovering the five reference colours…", batch=True)
 
     def stop(self):
         self.cancel_batch.set()

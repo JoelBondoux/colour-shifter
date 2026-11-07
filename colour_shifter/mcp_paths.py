@@ -10,6 +10,7 @@ from .images import IMAGE_EXTENSIONS
 
 
 MAX_BATCH_IMAGES = 250
+MAX_CATALOGUE_IMAGES = 1000
 
 
 def _local_path(value: str) -> Path:
@@ -86,3 +87,17 @@ class McpWorkspace:
                 if len(paths) > MAX_BATCH_IMAGES:
                     raise ValueError(f"Choose at most {MAX_BATCH_IMAGES} images per MCP batch.")
         return sorted(paths, key=lambda path: path.name.casefold())
+
+    def catalogue_images(self, value: str) -> list[Path]:
+        paths = []
+        folders = [self.directory(value)]
+        while folders:
+            for entry in folders.pop().iterdir():
+                mode = _metadata(entry).st_mode
+                if stat.S_ISDIR(mode):
+                    folders.append(self.directory(str(entry)))
+                elif entry.suffix.lower() in IMAGE_EXTENSIONS:
+                    paths.append(self.image(str(entry)))
+                    if len(paths) > MAX_CATALOGUE_IMAGES:
+                        raise ValueError(f"Choose at most {MAX_CATALOGUE_IMAGES} images per MCP catalogue.")
+        return sorted(paths, key=lambda path: str(path).casefold())

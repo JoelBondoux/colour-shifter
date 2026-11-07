@@ -1,6 +1,6 @@
 """GPU foreground selection and detail-preserving colour transfer."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -11,7 +11,9 @@ import onnxruntime as ort
 from PIL import Image, ImageChops
 
 from .images import open_image
+from .material import detect_colour, select_material
 from .model import MODEL_PATH, read_verified_model
+from .reflections import Reflections, reflection_cast
 from .swatches import RGB
 
 
@@ -54,23 +56,11 @@ class Segmenter:
         mask = mask.point(MASK_CURVE).resize(image.size, Image.Resampling.BILINEAR)
         if alpha.getextrema()[0] < 255:
             mask = ImageChops.multiply(mask, alpha.point([0] + [255] * 255))
-        if mask.getextrema()[1] < 128:
-            raise ValueError("The AI could not find a clear foreground product.")
         return mask
 
 
 def reference_colour(image: Image.Image, mask: Image.Image) -> RGB:
-    # Use the median of confidently selected pixels. A click can override this
-    # on a multicoloured reference or when a particular shade is needed.
-    size = image.size
-    scale = min(1.0, 512 / max(size))
-    size = tuple(max(1, round(value * scale)) for value in size)
-    preview = np.asarray(image.resize(size, Image.Resampling.BOX))
-    selection = np.asarray(mask.resize(size, Image.Resampling.BOX))
-    selected = preview[(selection >= 160) & (preview[:, :, 3] >= 128), :3]
-    if not selected.size:
-        raise ValueError("No solid colour found. Click a colour in the reference image.")
-    return tuple(np.rint(np.median(selected, axis=0)).astype(int).tolist())
+    return detect_colour(image, mask)
 
 
 def sample_colour(image: Image.Image, x: int, y: int) -> RGB:
@@ -81,30 +71,18 @@ def sample_colour(image: Image.Image, x: int, y: int) -> RGB:
     return tuple(np.rint(np.median(opaque, axis=0)).astype(int).tolist())
 
 
-def restrict_colour(image: Image.Image, mask: Image.Image, source: RGB) -> Image.Image:
-    source_hue, source_saturation, source_value = Image.new("RGB", (1, 1), source).convert("HSV").getpixel((0, 0))
-    hue, saturation, value = image.convert("RGB").convert("HSV").split()
-    levels = np.arange(256)
-    if source_saturation < 32 or source_value < 32:
-        # Hue is unstable near greys and very deep shadows.
-        affinity = saturation.point(np.rint(np.clip((92 - levels) / 56, 0, 1) * 255).tolist())
-        if source_value < 64:
-            darkness = value.point(np.rint(np.clip((128 - levels) / 64, 0, 1) * 255).tolist())
-            deep_shadows = value.point(np.rint(np.clip((60 - levels) / 32, 0, 1) * 255).tolist())
-            affinity = ImageChops.lighter(ImageChops.multiply(affinity, darkness), deep_shadows)
-        return ImageChops.multiply(mask, affinity)
-
-    distance = np.abs((levels - source_hue + 128) % 256 - 128)
-    hue_weight = np.rint(np.clip((40 - distance) / 24, 0, 1) * 255).tolist()
-    sat_floor = max(16, source_saturation * 0.25)
-    sat_weight = np.rint(np.clip((levels - sat_floor) / max(24, source_saturation * 0.35), 0, 1) * 255).tolist()
-    affinity = ImageChops.multiply(hue.point(hue_weight), saturation.point(sat_weight))
-    return ImageChops.multiply(mask, affinity)
+def apply_colour(
+    image: Image.Image, mask: Image.Image, target: RGB, *, reflections: Reflections | None = None,
+) -> Image.Image:
+    return next(colour_variants(image, mask, (target,), reflections=reflections))
 
 
-def apply_colour(image: Image.Image, mask: Image.Image, target: RGB) -> Image.Image:
+def colour_variants(
+    image: Image.Image, mask: Image.Image, targets: Iterable[RGB], *, reflections: Reflections | None = None,
+) -> Iterator[Image.Image]:
     rgb = image.convert("RGB")
     luminance = rgb.convert("L")
+    alpha = image.getchannel("A")
     solid = mask.point([0] * 128 + [255] * 128)
     histogram = np.cumsum(luminance.histogram(solid))
     if histogram[-1] == 0:
@@ -116,25 +94,47 @@ def apply_colour(image: Image.Image, mask: Image.Image, target: RGB) -> Image.Im
     delta = np.arange(256) - middle
     shadow = np.maximum(0, -delta / max(middle, 48))
     light = np.maximum(0, delta / max(255 - middle, 48))
-    # Leave some tonal range on both sides of pure black and white.
-    if max(target) < 12:
-        target = tuple(channel + 12 - max(target) for channel in target)
-    if min(target) > 243:
-        target = tuple(channel - min(target) + 243 for channel in target)
-    channels = [
-        luminance.point(np.rint(channel * (1 - shadow) + (255 - channel) * light).tolist())
-        for channel in target
-    ]
-    result = Image.composite(Image.merge("RGB", channels), rgb, mask)
-    result.putalpha(image.getchannel("A"))
-    return result
+    for target in targets:
+        # Leave some tonal range on both sides of pure black and white.
+        if max(target) < 12:
+            target = tuple(channel + 12 - max(target) for channel in target)
+        if min(target) > 243:
+            target = tuple(channel - min(target) + 243 for channel in target)
+        channels = [
+            luminance.point(np.rint(channel * (1 - shadow) + (255 - channel) * light).tolist())
+            for channel in target
+        ]
+        result = Image.composite(Image.merge("RGB", channels), rgb, mask)
+        result.putalpha(alpha)
+        if reflections is not None:
+            reflections.apply(result, target)
+        yield result
+
+
+def prepare_recolour(
+    segmenter: Segmenter, image: Image.Image, source: RGB | None,
+) -> tuple[RGB, Image.Image, Reflections | None]:
+    colour, mask = select_material(image, segmenter.foreground(image), source)
+    return colour, mask, reflection_cast(image, mask, colour)
 
 
 def recolour(segmenter: Segmenter, image: Image.Image, target: RGB, source: RGB | None) -> Image.Image:
-    mask = segmenter.foreground(image)
-    if source is not None:
-        mask = restrict_colour(image, mask, source)
-    return apply_colour(image, mask, target)
+    _, mask, reflections = prepare_recolour(segmenter, image, source)
+    return apply_colour(image, mask, target, reflections=reflections)
+
+
+def save_png(result: Image.Image, output: Path) -> None:
+    temporary = output.with_suffix(".part")
+    owns_temporary = False
+    try:
+        with temporary.open("xb") as stream:
+            owns_temporary = True
+            result.save(stream, format="PNG", compress_level=3)
+        temporary.rename(output)
+        owns_temporary = False
+    finally:
+        if owns_temporary:
+            temporary.unlink(missing_ok=True)
 
 
 def export_batch(
@@ -145,6 +145,8 @@ def export_batch(
     source: RGB | None,
     progress: Callable[[int, str], None],
     cancelled: Callable[[], bool],
+    *,
+    overrides: Mapping[Path, RGB] | None = None,
 ) -> tuple[Path, int, list[str]]:
     prefix = datetime.now().strftime("colour-shifter-%Y%m%d-%H%M%S-")
     run_folder = Path(mkdtemp(prefix=prefix, dir=destination))
@@ -156,21 +158,13 @@ def export_batch(
         progress(index - 1, f"Processing {index} of {len(paths)} · {path.name}")
         # A fresh run folder and numbered files also separate duplicate stems.
         output = run_folder / f"{index:04d}-{path.stem[:80]}.png"
-        temporary = output.with_suffix(".part")
-        owns_temporary = False
         try:
-            result = recolour(segmenter, open_image(path), target, source)
-            with temporary.open("xb") as stream:
-                owns_temporary = True
-                result.save(stream, format="PNG")
-            temporary.rename(output)
-            owns_temporary = False
+            starting_colour = overrides.get(path, source) if overrides is not None else source
+            result = recolour(segmenter, open_image(path), target, starting_colour)
+            save_png(result, output)
             successes += 1
         except (OSError, ValueError, Image.DecompressionBombError) as error:
             failures.append(f"{path.name} — {error}")
-        finally:
-            if owns_temporary:
-                temporary.unlink(missing_ok=True)
         progress(index, f"Processed {index} of {len(paths)}")
 
     if failures:
